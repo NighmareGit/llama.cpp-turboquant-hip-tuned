@@ -1,0 +1,98 @@
+# ==============================================================================
+# Romulus Compute Grid - COMPARTMENTALIZED: DEDICATED LLAMA-RPC-SERVER + TURBOQUANT (gfx1100)
+# Source: NighmareGit/llama.cpp-turboquant-hip-tuned (our tuned fork)
+# Branch: feature/turboquant-cuda-rpc-build-fixed (local gitea primary)
+# Targets: i7-14700K + 7900 XTX | ROCm 6.4-complete + domvox TurboQuant HIP
+# -Ofast + plain -flto + AMD matrix flags + GGML_SCHED_MAX_COPIES=2 (middle-ground CPU safety)
+# 100% non-destructive / additive only — permanent Docker safety rule compliant
+#
+# This is the clean single-purpose image for llama-rpc-server nodes (e.g. KV cache coordination,
+# distributed inference workers, or RPC frontends). Use the companion pure server Dockerfile
+# for standard inference worker nodes.
+# Proxy IP is configurable via --build-arg PROXY_IP=...
+#
+# Runtime: The image provides both llama-server and llama-rpc-server binaries.
+# Default CMD runs the RPC server on port 50053. Override with docker run ... for custom flags.
+# ==============================================================================
+
+ARG PROXY_IP=192.168.8.108
+
+FROM docker.io/rocm/dev-ubuntu-22.04:6.4-complete AS build-stage
+
+# === LOCAL CACHE INTEGRATION (graceful fallback) ===
+RUN bash -c 'timeout 1 bash -c "cat < /dev/null > /dev/tcp/'${PROXY_IP}'/3128" 2>/dev/null && (echo "Acquire::http::Proxy \"http://'${PROXY_IP}':3128\";" > /etc/apt/apt.conf.d/01proxy && sed -i "/jammy-updates/d; /jammy-backports/d; /jammy-security/d" /etc/apt/sources.list) || echo "Squid proxy offline"'
+
+RUN apt-get update && apt-get install -y \
+    git build-essential cmake ninja-build \
+    hipblas-dev rocblas-dev hipblaslt-dev rocwmma-dev \
+    && apt-get clean
+
+WORKDIR /build
+
+# === SOURCE: Our tuned fork (primary for Romulus Grid) ===
+ARG GIT_BRANCH=feature/turboquant-cuda-rpc-build-fixed
+
+RUN git clone http://192.168.8.108:3005/hunter/llama.cpp-turboquant-hip-tuned.git . && \
+    git checkout ${GIT_BRANCH}
+
+# Threading yield patch (avoids busy-wait on ROCm HIP)
+RUN sed -i 's/ggml_yield();/__asm__ volatile("pause" ::: "memory"); ggml_yield();/g' \
+    ggml/src/ggml-threading.cpp || true
+
+ENV HIP_DEVICE_LIB_PATH=/opt/rocm-6.4.0/amdgcn/bitcode
+ARG CACHEBUST=20250622
+
+# RPC version check patch (defensive, required when GGML_RPC=ON)
+RUN find . -name "ggml-rpc.h" -exec sed -i 's/== 96/>= 96/' {} + || true
+
+# AMD ROCm build with max optimizations + middle-ground CPU safety
+RUN HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+    cmake -S . -B build -G Ninja \
+    -DGGML_HIP=ON \
+    -DGPU_TARGETS=gfx1100 \
+    -DGGML_RPC=ON \
+    -DGGML_HIP_ROCWMMA=ON \
+    -DGGML_HIP_ROCWMMA_FATTN=ON \
+    -DROCWMMA_WMMA=ON \
+    -DGGML_NATIVE=ON \
+    -DGGML_SCHED_MAX_COPIES=2 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_FLAGS="-Ofast -march=native -fopenmp -funroll-loops -ftree-vectorize -flto" \
+    -DCMAKE_C_FLAGS="-Ofast -march=native -fopenmp -funroll-loops -ftree-vectorize -flto" \
+    -DCMAKE_HIP_FLAGS="--rocm-device-lib-path=/opt/rocm-6.4.0/amdgcn/bitcode -O3 -mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false" \
+    && VERBOSE=1 cmake --build build --config Release -- -j$(nproc)
+
+# Stage both binaries defensively (handles possible upstream naming: rpc-server or llama-rpc-server)
+RUN mkdir -p /staging/bin /staging/lib \
+    && cp build/bin/llama-server /staging/bin/ \
+    && (cp build/bin/rpc-server /staging/bin/llama-rpc-server \
+        || cp build/bin/llama-rpc-server /staging/bin/llama-rpc-server \
+        || true) \
+    && find build -name "*.so*" -exec cp -v {} /staging/lib/ \;
+
+# ==============================================================================
+# Runtime stage
+# ==============================================================================
+FROM docker.io/rocm/dev-ubuntu-22.04:6.4-complete AS runtime-stage
+
+# === LOCAL CACHE INTEGRATION (runtime apt) ===
+RUN bash -c 'timeout 1 bash -c "cat < /dev/null > /dev/tcp/'${PROXY_IP}'/3128" 2>/dev/null && (echo "Acquire::http::Proxy \"http://'${PROXY_IP}':3128\";" > /etc/apt/apt.conf.d/01proxy && sed -i "/jammy-updates/d; /jammy-backports/d; /jammy-security/d" /etc/apt/sources.list) || echo "Squid proxy offline"'
+
+RUN apt-get update && apt-get install -y \
+    hipblas-dev rocblas-dev hipblaslt-dev \
+    && apt-get clean
+
+WORKDIR /app
+
+COPY --from=build-stage /staging/bin/ /usr/local/bin/
+COPY --from=build-stage /staging/lib/ /usr/local/lib/
+
+RUN echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf \
+    && echo "/usr/local/lib" >> /etc/ld.so.conf.d/rocm.conf \
+    && ldconfig
+
+EXPOSE 8080
+EXPOSE 50053
+
+# Default: run as RPC server. Override CMD or use docker run ... llama-server for dual-use.
+CMD ["/usr/local/bin/llama-rpc-server", "--host", "0.0.0.0", "--port", "50053"]
